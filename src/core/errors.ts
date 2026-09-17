@@ -26,6 +26,18 @@ export class UpstreamError extends Error {
   readonly service: string;
   readonly retryable: boolean;
   readonly hint: string | undefined;
+  /**
+   * Whether the upstream's side of the action is genuinely unknown.
+   *
+   * `false` means we know: either the upstream answered and declined, or the
+   * request never got there. `true` means we do not know - a timeout or a
+   * broken connection cannot distinguish "never processed" from "processed,
+   * response lost".
+   *
+   * Only writes care, and for them it is the difference between a safe resend
+   * and a duplicate. A read can be repeated whatever this says.
+   */
+  readonly outcomeUncertain: boolean;
 
   constructor(options: {
     service: string;
@@ -33,6 +45,7 @@ export class UpstreamError extends Error {
     status?: number | undefined;
     retryable?: boolean;
     hint?: string | undefined;
+    outcomeUncertain?: boolean;
     cause?: unknown;
   }) {
     super(options.message, options.cause !== undefined ? { cause: options.cause } : undefined);
@@ -41,6 +54,7 @@ export class UpstreamError extends Error {
     this.status = options.status;
     this.retryable = options.retryable ?? false;
     this.hint = options.hint;
+    this.outcomeUncertain = options.outcomeUncertain ?? false;
   }
 }
 

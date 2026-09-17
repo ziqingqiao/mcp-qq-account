@@ -654,6 +654,118 @@ async function main(): Promise<void> {
     check('canSend defaults to true', client2.canSend === true);
   }
 
+  // ---------------------------------------------------------------------------
+  // 12. Retry policy: a read may repeat, a write may not
+  // ---------------------------------------------------------------------------
+  process.stderr.write('\nretry policy\n');
+
+  {
+    // A 503 is retryable for a read and must NOT be retried for a send. The
+    // upstream may have delivered the message and failed only to say so, and a
+    // second attempt would put a duplicate in the conversation - where it
+    // cannot be recalled. Note maxRetries > 0: with the usual 0 every other
+    // test in this file would pass whatever the send path did.
+    const mock = await startMock(() => ({
+      status: 503,
+      payload: { status: 'failed', retcode: 0, message: 'overloaded' },
+    }));
+
+    const client = new OneBotClient({
+      baseUrl: mock.url,
+      accessToken: undefined,
+      timeoutMs: 2_000,
+      maxRetries: 2,
+      logger: log,
+    });
+
+    let sendError: unknown;
+    try {
+      await client.sendToUser('800002', 'hello');
+    } catch (error) {
+      sendError = error;
+    }
+
+    const sendAttempts = mock.calls.filter((call) => call.action === 'send_private_msg').length;
+    check('a retryable status on a send still fails', sendError instanceof UpstreamError);
+    check('a send is attempted exactly once', sendAttempts === 1, `attempts: ${sendAttempts}`);
+    check(
+      'the failure says delivery is unknown rather than failed',
+      sendError instanceof UpstreamError && /unknown/i.test(`${sendError.message} ${sendError.hint ?? ''}`),
+      sendError instanceof UpstreamError ? `${sendError.message} | ${sendError.hint ?? ''}` : String(sendError),
+    );
+    check(
+      'the hint tells the caller to check before resending',
+      sendError instanceof UpstreamError && /before resending|twice/i.test(sendError.hint ?? ''),
+      sendError instanceof UpstreamError ? (sendError.hint ?? '') : String(sendError),
+    );
+
+    await new Promise<void>((resolve) => mock.server.close(() => resolve()));
+  }
+
+  {
+    // The same status on a read IS retried. Without this the previous check
+    // would also pass if the retry had simply been switched off everywhere,
+    // which would be a different bug wearing the same green tick.
+    const mock = await startMock(() => ({
+      status: 503,
+      payload: { status: 'failed', retcode: 0, message: 'overloaded' },
+    }));
+
+    const client = new OneBotClient({
+      baseUrl: mock.url,
+      accessToken: undefined,
+      timeoutMs: 2_000,
+      maxRetries: 2,
+      logger: log,
+    });
+
+    let readError: unknown;
+    try {
+      await client.getAccount();
+    } catch (error) {
+      readError = error;
+    }
+
+    const readAttempts = mock.calls.filter((call) => call.action === 'get_login_info').length;
+    check('a retryable status on a read still fails eventually', readError instanceof UpstreamError);
+    check('a read is retried', readAttempts > 1, `attempts: ${readAttempts}`);
+
+    await new Promise<void>((resolve) => mock.server.close(() => resolve()));
+  }
+
+  {
+    // An explicit rejection is a fact, not a guess: the upstream answered and
+    // said it did nothing. Relabelling that "delivery unknown" would make the
+    // caller needlessly afraid to resend a message that was never sent.
+    const mock = await startMock(() => rejected(1404, 'not in conversation'));
+
+    const client = new OneBotClient({
+      baseUrl: mock.url,
+      accessToken: undefined,
+      timeoutMs: 2_000,
+      maxRetries: 2,
+      logger: log,
+    });
+
+    let rejectedError: unknown;
+    try {
+      await client.sendToUser('800002', 'hello');
+    } catch (error) {
+      rejectedError = error;
+    }
+
+    const rejectedAttempts = mock.calls.filter((call) => call.action === 'send_private_msg').length;
+    check('a rejected send is still an error', rejectedError instanceof UpstreamError);
+    check(
+      'a rejection is not relabelled as uncertain delivery',
+      rejectedError instanceof UpstreamError && !rejectedError.outcomeUncertain,
+      String(rejectedError instanceof UpstreamError ? rejectedError.outcomeUncertain : 'not an UpstreamError'),
+    );
+    check('a rejected send is attempted exactly once', rejectedAttempts === 1, `attempts: ${rejectedAttempts}`);
+
+    await new Promise<void>((resolve) => mock.server.close(() => resolve()));
+  }
+
   process.stderr.write(`\n${failures} failure(s)\n`);
   if (failures > 0) {
     process.exitCode = 1;

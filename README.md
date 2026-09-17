@@ -230,7 +230,7 @@ npm run verify
 | `ONEBOT_BASE_URL` | `http://127.0.0.1:3000` | OneBot HTTP API 地址 |
 | `ONEBOT_ACCESS_TOKEN` | 空 | OneBot 的 token,**仅服务端读取**;永远不是工具参数 |
 | `UPSTREAM_TIMEOUT_MS` | `15000` | 单次上游请求超时 |
-| `UPSTREAM_MAX_RETRIES` | `1` | 可重试状态码的重试次数。**默认比 SaaS 那套低**:发消息不是幂等的,重试可能发出两条 |
+| `UPSTREAM_MAX_RETRIES` | `1` | 可重试状态码的重试次数。**只作用于读**;写操作永不自动重试,见「发送为什么永不重试」 |
 | `QQ_EVENT_ENABLED` | `true` | 关掉则不再接收新消息(队列里已有的仍可读) |
 | `QQ_EVENT_HOST` | `127.0.0.1` | 事件接收器绑定地址 |
 | `QQ_EVENT_PORT` | `8790` | 事件接收器端口 |
@@ -327,6 +327,29 @@ schtasks /Create /TN "mcp-qq-account receiver" /SC ONLOGON /RL LIMITED /F `
 
 > **这是约定,不是强制。** 模型仍可能被绕过。真正的防线是:不要把 `qq_send_message` 交给一个会自主行动的 Agent,除非你接受它偶尔发错消息。
 
+### 发送永不自动重试
+
+`UPSTREAM_MAX_RETRIES` 只作用于读。**写操作永远只尝试一次**,这是刻意的。
+
+重试的本质是**赌第一次到底生效了没有**,而超时**赌不出来**:上游可能已经把消息发出去了,只是响应丢了。对读来说赌错只是慢一次;对发送来说赌错就是**对方聊天窗口里多出一条一样的话,而且撤不回来**。
+
+失败时的文案也因此不同。**「发送失败」是错的**,它会诱导调用方手动重发,结果造出它本想避免的那条重复消息:
+
+```
+send_private_msg did not complete, and whether it was delivered is unknown: ...
+  → Delivery is UNKNOWN, not failed - the message may already be in the conversation.
+    Check it (qq_get_conversation_history) before resending, or you will post it twice.
+```
+
+**「上游明确拒绝」和「不知道」是两回事,不能混为一谈:**
+
+| 情况 | 结论 | 能否直接重发 |
+| --- | --- | --- |
+| retcode 非零 / 4xx | 上游答复了,明确没做 | ✅ 可以 |
+| 超时 / 5xx / 408 / 425 / 429 / 连接中断 | **不知道做没做** | ❌ 先查会话再决定 |
+
+代码里用 `UpstreamError.outcomeUncertain` 表达这个区分,只有写路径会读它。测试覆盖了三种情况:写不重试、**读仍然重试**(否则「不重试」可能只是把重试整个关掉了)、以及明确拒绝不被误标成「不确定」。
+
 ### 事件接收器必须鉴权
 
 ```
@@ -355,7 +378,7 @@ npm run verify
 | --- | --- |
 | `verify:inbox` | 去重(含「同 id 不同到达时间」)、读不消费、确认与归档、路径逃逸拒绝、截断、坏文件跳过、队列上限 |
 | `verify:events` | 真实 HTTP:token 鉴权、路径路由、超大与畸形 body、自己的消息被丢弃、心跳/通知/请求被忽略、私聊与群聊解析、图片配文回退、**独立接收器抢输端口后不退出、并在端口释放后自动接管** |
-| `verify:onebot` | 真实 HTTP(mock 上游):**`retcode` 非零在 HTTP 200 下必须报错**、`status:"failed"` 且 retcode 为 0 也必须报错、每个已映射 retcode 给出各自的可操作提示、未映射的也仍有提示、**文本以 segment 发送使 `[CQ:at,qq=all]` 保持字面**、大数 id 转字符串不丢精度、`remark` 优先于昵称、畸形上游降级为空表而非抛错、历史反转为最旧优先、不支持的实现明确说「不支持」而非泛化失败、凭证只在 header 不进 body |
+| `verify:onebot` | 真实 HTTP(mock 上游):**`retcode` 非零在 HTTP 200 下必须报错**、`status:"failed"` 且 retcode 为 0 也必须报错、每个已映射 retcode 给出各自的可操作提示、未映射的也仍有提示、**文本以 segment 发送使 `[CQ:at,qq=all]` 保持字面**、大数 id 转字符串不丢精度、`remark` 优先于昵称、畸形上游降级为空表而非抛错、历史反转为最旧优先、不支持的实现明确说「不支持」而非泛化失败、凭证只在 header 不进 body、**重试策略:可重试状态码下写只尝试一次而读会重试、写失败必须说「送达未知」、明确拒绝不得被误标为不确定** |
 | `verify:tools` | 工具层真实 stdio:历史正文必须出现在**文本输出**里(而非只在结构化内容)、顺序仍是最旧优先、结构化内容同时保留、**未命中的 ack id 必须逐个点名而非只报数量**、发送回执可被引用、**文本以 segment 数组抵达 OneBot**、收件人 id 以字符串传递 |
 | `verify:http` | 真实 HTTP:无 token / 错 token 被 401 拒绝且不泄露 token、正确 token 握手成功、**两个传输暴露同一组 6 个工具**、服务器说明(不可信内容规则)在 HTTP 下同样送达、工具失败是 `isError` 而非协议错误、`QQ_SEND_ENABLED=false` 在这条路上同样被强制、`/healthz` 免鉴权但不泄露凭证、无密钥部署时端点确实开放(断言而非假设) |
 | `smoke` | 协议握手、版本协商、stdout 纯净性、**服务器说明里必须含不可信内容规则** |
@@ -375,6 +398,7 @@ npm run verify
 | `tools.ts` 里历史摘要改回只报计数 | `FAIL` ×3 → **可被捕获** |
 | `receiver.ts` 里改回「抢不到端口就退出」 | `FAIL` ×2 → **可被捕获** |
 | `tools.ts` 里 ack 文案改回只报未命中数量 | `FAIL` ×2 → **可被捕获** |
+| `client.ts` 里把发送的 `{ retry: false }` 去掉 | `FAIL` ×1（`attempts: 3`）→ **可被捕获** |
 
 **一个永远不会失败的测试比没有测试更糟**——它会把「已经检查过了」这个错误结论卖给下一个读它的人。任何新增的安全相关断言都应当这样验一遍再提交。
 

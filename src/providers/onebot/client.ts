@@ -198,12 +198,47 @@ export class OneBotClient {
   }
 
   async sendToUser(userId: string, text: string, signal?: AbortSignal): Promise<SendReceipt> {
-    const data = await this.call('send_private_msg', { user_id: userId, message: textSegment(text) }, signal);
-    return { messageId: readId(asRecord(data).message_id) ?? 'unknown' };
+    return this.send('send_private_msg', { user_id: userId, message: textSegment(text) }, signal);
   }
 
   async sendToGroup(groupId: string, text: string, signal?: AbortSignal): Promise<SendReceipt> {
-    const data = await this.call('send_group_msg', { group_id: groupId, message: textSegment(text) }, signal);
+    return this.send('send_group_msg', { group_id: groupId, message: textSegment(text) }, signal);
+  }
+
+  /**
+   * Send a message, with the two properties a write needs and a read does not.
+   *
+   * **No automatic retry.** A retry is a bet on whether the first attempt took
+   * effect, and a timeout cannot settle that bet: the upstream may have
+   * delivered the message and lost only the response. For a read a wrong bet
+   * costs a slow call; for a send it puts a second copy in someone's chat,
+   * where it cannot be recalled.
+   *
+   * **A failure says delivery is unknown, not that it failed.** Otherwise the
+   * caller reads "send failed", resends by hand, and produces exactly the
+   * duplicate that dropping the retry was meant to prevent. An explicit
+   * rejection is different and passes through untouched: there the upstream
+   * told us nothing happened, so a resend is safe.
+   */
+  private async send(action: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<SendReceipt> {
+    let data: unknown;
+    try {
+      data = await this.call(action, body, signal, { retry: false });
+    } catch (error) {
+      if (!(error instanceof UpstreamError) || !error.outcomeUncertain) throw error;
+
+      throw new UpstreamError({
+        service: error.service,
+        message: `${action} did not complete, and whether it was delivered is unknown: ${error.message}`,
+        retryable: false,
+        hint:
+          'Delivery is UNKNOWN, not failed - the message may already be in the conversation. ' +
+          'Check it (qq_get_conversation_history) before resending, or you will post it twice.',
+        outcomeUncertain: true,
+        cause: error,
+      });
+    }
+
     return { messageId: readId(asRecord(data).message_id) ?? 'unknown' };
   }
 
@@ -266,12 +301,18 @@ export class OneBotClient {
    * carrying a hint the model can act on, because a bare "failed" teaches it
    * nothing and invites an identical retry.
    */
-  private async call(action: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+  private async call(
+    action: string,
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+    options: { retry?: boolean } = {},
+  ): Promise<unknown> {
     const envelope = await this.http.request<Envelope>(
       {
         method: 'POST',
         path: `/${action}`,
         body,
+        ...(options.retry === false ? { retry: false } : {}),
         ...(signal ? { signal } : {}),
       },
       (raw) => (raw === null ? {} : (raw as Envelope)),
@@ -288,6 +329,9 @@ export class OneBotClient {
         message: `${action} was rejected with retcode ${retcode}: ${detail}`,
         retryable: false,
         hint: hintForRetcode(retcode),
+        // The upstream answered and declined. Unlike a timeout, this is a fact
+        // about what happened, so a write that reaches here did not take place.
+        outcomeUncertain: false,
       });
     }
 

@@ -27,6 +27,16 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   /** Overrides the client timeout for slow endpoints (search, reports). */
   timeoutMs?: number;
+  /**
+   * Set to `false` for a call that changes state.
+   *
+   * Retrying a write is a guess about whether the first attempt took effect,
+   * and a timeout cannot answer that: the upstream may have performed the
+   * action and lost only the response. Reads can be repeated for free, so a
+   * wrong guess costs a slow call; a write repeated wrongly is a duplicate the
+   * caller cannot take back.
+   */
+  retry?: boolean;
   /** MCP request cancellation signal, forwarded downstream. */
   signal?: AbortSignal | undefined;
 }
@@ -78,7 +88,7 @@ export class HttpClient {
     const method = options.method ?? 'GET';
     const url = buildUrl(this.options.baseUrl, options.path, options.query);
     const timeoutMs = options.timeoutMs ?? this.options.timeoutMs;
-    const attempts = this.options.maxRetries + 1;
+    const attempts = options.retry === false ? 1 : this.options.maxRetries + 1;
 
     let lastError: unknown;
 
@@ -122,6 +132,10 @@ export class HttpClient {
           message,
           retryable: retryable && remaining > 0,
           hint: hintForStatus(response.status, this.options.service),
+          // A server-side failure (5xx) or an overload signal (408/425/429) can
+          // mean the request was accepted and the response lost. A plain 4xx
+          // is the upstream telling us it did nothing.
+          outcomeUncertain: retryable,
         });
 
         this.options.logger.warn('upstream error', {
@@ -165,6 +179,10 @@ export class HttpClient {
               : `the request could not reach the ${this.options.service} API`,
             retryable: false,
             hint: 'Check network egress and the configured base URL before retrying.',
+            // We never saw a response, so we cannot say whether the request was
+            // processed. A read does not care; a write must not assume either
+            // way, because guessing "it failed" produces a duplicate.
+            outcomeUncertain: true,
             cause: caught,
           });
         }
