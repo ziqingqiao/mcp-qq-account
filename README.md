@@ -236,6 +236,7 @@ npm run verify
 | `QQ_EVENT_PORT` | `8790` | 事件接收器端口 |
 | `QQ_EVENT_PATH` | `/onebot/events` | 事件接收器路径 |
 | `QQ_EVENT_TOKEN` | 空 | 上报鉴权。**绑定非回环地址时必填,否则拒绝启动** |
+| `QQ_EVENT_BIND_RETRY_SECONDS` | `0` | 端口被占时的重试间隔。`0` = 抢不到就退出(宿主拉起的副本用)。**独立接收器应设为 `30`**,见下文 |
 | `QQ_INBOX_DIR` | `<cwd>/inbox-data` | 消息队列目录。**部署时务必写成绝对路径**,见下文 |
 | `QQ_INBOX_MAX_BATCH` | `50` | 一次读取的上限 |
 | `QQ_SEND_ENABLED` | `true` | **运维开关**:设为 `false` 则只读不发 |
@@ -283,12 +284,26 @@ MCP 服务启动时会顺带起一个事件接收器,但**它只活在 MCP 进�
 如果你需要「人不在也要收着」,把接收器单独常驻:
 
 ```bash
-npm run receiver
+QQ_EVENT_BIND_RETRY_SECONDS=30 npm run receiver
 ```
 
 它只做一件事:占住端口、把事件写进同一个队列。MCP 服务随后会发现端口被占,记一条 warn 然后**照常读同一个队列**——这是设计好的分工,不是冲突。
 
-常驻方式随平台:Windows 计划任务(勾「不管用户是否登录都运行」)、launchd、systemd、pm2,或者干脆留一个终端窗口开着。
+**`QQ_EVENT_BIND_RETRY_SECONDS` 别省。** 开机时它和宿主都在抢这个端口,而宿主那份**抢不到就退出、不会重试**。如果独立接收器也抢输就退出,那它开机就死了——等宿主关闭时端口上仍然没人,等于白装。设了重试,它就只是等着,宿主一关自动接管。这条行为有测试覆盖(`verify:events` 的 `standalone receiver` 一节)。
+
+常驻方式随平台:launchd、systemd、pm2,或者干脆留一个终端窗口开着。
+
+Windows 上用计划任务(需**管理员** PowerShell):
+
+```powershell
+$node = "C:\Users\<你>\.workbuddy-ai\binaries\node\versions\22.22.2-2\node.exe"
+$app  = "E:\workbuddy\mcp-qq-gateway\mcp-qq-account"
+
+schtasks /Create /TN "mcp-qq-account receiver" /SC ONLOGON /RL LIMITED /F `
+  /TR "cmd /c cd /d `"$app`" && `"$node`" --env-file-if-exists=.env dist\scripts\receiver.js >> `"$app\receiver.log`" 2>&1"
+```
+
+`--env-file-if-exists=.env` 是必需的:计划任务的工作目录不是项目目录,不显式指定就读不到 `QQ_INBOX_DIR` 和重试间隔。**注意路径不要带中文**,否则 `.cmd` 包装层会因代码页问题读不到文件。
 
 ---
 
@@ -339,7 +354,7 @@ npm run verify
 | 套件 | 覆盖 |
 | --- | --- |
 | `verify:inbox` | 去重(含「同 id 不同到达时间」)、读不消费、确认与归档、路径逃逸拒绝、截断、坏文件跳过、队列上限 |
-| `verify:events` | 真实 HTTP:token 鉴权、路径路由、超大与畸形 body、自己的消息被丢弃、心跳/通知/请求被忽略、私聊与群聊解析、图片配文回退 |
+| `verify:events` | 真实 HTTP:token 鉴权、路径路由、超大与畸形 body、自己的消息被丢弃、心跳/通知/请求被忽略、私聊与群聊解析、图片配文回退、**独立接收器抢输端口后不退出、并在端口释放后自动接管** |
 | `verify:onebot` | 真实 HTTP(mock 上游):**`retcode` 非零在 HTTP 200 下必须报错**、`status:"failed"` 且 retcode 为 0 也必须报错、每个已映射 retcode 给出各自的可操作提示、未映射的也仍有提示、**文本以 segment 发送使 `[CQ:at,qq=all]` 保持字面**、大数 id 转字符串不丢精度、`remark` 优先于昵称、畸形上游降级为空表而非抛错、历史反转为最旧优先、不支持的实现明确说「不支持」而非泛化失败、凭证只在 header 不进 body |
 | `verify:tools` | 工具层真实 stdio:历史正文必须出现在**文本输出**里(而非只在结构化内容)、顺序仍是最旧优先、结构化内容同时保留、发送回执可被引用、**文本以 segment 数组抵达 OneBot**、收件人 id 以字符串传递 |
 | `verify:http` | 真实 HTTP:无 token / 错 token 被 401 拒绝且不泄露 token、正确 token 握手成功、**两个传输暴露同一组 6 个工具**、服务器说明(不可信内容规则)在 HTTP 下同样送达、工具失败是 `isError` 而非协议错误、`QQ_SEND_ENABLED=false` 在这条路上同样被强制、`/healthz` 免鉴权但不泄露凭证、无密钥部署时端点确实开放(断言而非假设) |
@@ -358,6 +373,7 @@ npm run verify
 | `client.ts` 里 `if (retcode !== 0 ...)` 改成永假 | `FAIL` ×7 → **可被捕获** |
 | `client.ts` 里 `textSegment()` 改成直接返回字符串 | `FAIL` ×4 → **可被捕获** |
 | `tools.ts` 里历史摘要改回只报计数 | `FAIL` ×3 → **可被捕获** |
+| `receiver.ts` 里改回「抢不到端口就退出」 | `FAIL` ×2 → **可被捕获** |
 
 **一个永远不会失败的测试比没有测试更糟**——它会把「已经检查过了」这个错误结论卖给下一个读它的人。任何新增的安全相关断言都应当这样验一遍再提交。
 
@@ -415,7 +431,7 @@ src/
     ├── verify-onebot.ts      OneBot 适配层验证(mock 上游:retcode、分段、历史顺序)
     ├── verify-tools.ts       工具层验证(真实 stdio:文本输出里到底有没有正文)
     ├── verify-http.ts        HTTP 传输验证(鉴权、工具一致性、kill switch)
-    ├── receiver.ts           独立事件接收器:宿主关着也能收消息
+    ├── receiver.ts           独立事件接收器:宿主关着也能收消息,端口被占则等待接管
     └── probe-onebot.ts       上游连通性探测
 ```
 

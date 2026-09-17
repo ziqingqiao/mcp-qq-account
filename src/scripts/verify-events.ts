@@ -19,9 +19,12 @@
  * Runs on a random high port on loopback. No network, no OneBot, no account.
  */
 
+import { spawn } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type { AppConfig } from '../config.js';
 import { createLogger } from '../core/logger.js';
@@ -39,6 +42,38 @@ function check(label: string, condition: boolean, detail?: string): void {
   process.stderr.write(`  FAIL  ${label}${detail === undefined ? '' : ` - ${detail}`}\n`);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/** Is anything accepting connections on this port? */
+function canConnect(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect(port, '127.0.0.1');
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
+}
+
+/** Bind an arbitrary free port and hand back both the server and its number. */
+function occupyPort(): Promise<{ server: ReturnType<typeof createServer>; port: number }> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      resolve({ server, port: typeof address === 'object' && address !== null ? address.port : 0 });
+    });
+  });
+}
+
 const log = createLogger('error');
 const TOKEN = 'verify-token-9f3a';
 
@@ -49,7 +84,7 @@ function buildConfig(port: number, dir: string, token: string | undefined): AppC
     server: { name: 'qq-account', version: '0.0.0-test' },
     onebot: { baseUrl: 'http://127.0.0.1:1', accessToken: undefined, sendEnabled: true },
     upstream: { timeoutMs: 5_000, maxRetries: 0 },
-    events: { enabled: true, host: '127.0.0.1', port, path: '/onebot/events', token },
+    events: { enabled: true, host: '127.0.0.1', port, path: '/onebot/events', token, bindRetrySeconds: 0 },
     inbox: { dir, maxBatch: 50 },
     http: { host: '127.0.0.1', port: 0, path: '/mcp', apiKeys: [], allowedHosts: [] },
   };
@@ -222,6 +257,59 @@ async function main(): Promise<void> {
       read.messages.map((entry) => entry.platformMessageId).join(',') === '1001,1002,1005,1006',
       read.messages.map((entry) => entry.platformMessageId).join(','),
     );
+
+    // -------------------------------------------------------------------------
+    // The standalone receiver waits for the port instead of exiting
+    // -------------------------------------------------------------------------
+    process.stderr.write('\nstandalone receiver\n');
+
+    {
+      // The receiver normally runs as a long-lived process precisely so that
+      // the port is owned while the host is closed. A copy that lost the race
+      // at boot and exited would leave nothing listening the moment the host
+      // went away - the exact window it exists to cover - and it would do so
+      // silently. Hence: it must wait, not die.
+      const { server: blocker, port: blockerPort } = await occupyPort();
+
+      const receiver = spawn(process.execPath, [fileURLToPath(new URL('./receiver.js', import.meta.url))], {
+        env: {
+          ...process.env,
+          LOG_LEVEL: 'info',
+          QQ_EVENT_ENABLED: 'true',
+          QQ_EVENT_HOST: '127.0.0.1',
+          QQ_EVENT_PORT: String(blockerPort),
+          QQ_EVENT_BIND_RETRY_SECONDS: '1',
+          QQ_INBOX_DIR: dir,
+        },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+
+      let receiverStderr = '';
+      receiver.stderr?.on('data', (chunk: Buffer) => {
+        receiverStderr += chunk.toString('utf8');
+      });
+
+      await sleep(2_500);
+      check(
+        'a receiver that lost the port race stays alive',
+        receiver.exitCode === null,
+        `exited with ${String(receiver.exitCode)}: ${receiverStderr}`,
+      );
+
+      await new Promise<void>((resolve) => {
+        blocker.close(() => resolve());
+      });
+
+      let tookOver = false;
+      for (let attempt = 0; attempt < 40 && !tookOver; attempt += 1) {
+        await sleep(250);
+        tookOver = await canConnect(blockerPort);
+      }
+      check('it takes the port over once it is released', tookOver, receiverStderr);
+
+      receiver.kill('SIGTERM');
+      await sleep(500);
+    }
 
     process.stderr.write(`\n${failures} failure(s)\n`);
     if (failures > 0) {

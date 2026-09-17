@@ -99,7 +99,7 @@ function buildConfig(port: number, dir: string, apiKeys: readonly string[], send
     upstream: { timeoutMs: 3_000, maxRetries: 0 },
     // The event receiver is not what this suite is about, and leaving it off
     // means this process owns exactly one port.
-    events: { enabled: false, host: '127.0.0.1', port: 0, path: '/onebot/events', token: undefined },
+    events: { enabled: false, host: '127.0.0.1', port: 0, path: '/onebot/events', token: undefined, bindRetrySeconds: 0 },
     inbox: { dir, maxBatch: 50 },
     http: { host: '127.0.0.1', port, path: '/mcp', apiKeys, allowedHosts: [] },
   };

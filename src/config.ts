@@ -55,6 +55,17 @@ export interface AppConfig {
     readonly port: number;
     readonly path: string;
     readonly token: string | undefined;
+    /**
+     * Seconds between bind attempts when the port is already held.
+     *
+     * `0` means give up immediately, which is right for the copy the host
+     * spawns: something else owning the port is the expected steady state, not
+     * a fault. The standalone receiver sets this so that a copy started while
+     * the host is running waits its turn instead of exiting - otherwise it
+     * dies at boot and nothing is listening once the host closes, which is
+     * exactly the window it exists to cover.
+     */
+    readonly bindRetrySeconds: number;
   };
   readonly inbox: {
     /** Resolved to an absolute path: see the note in loadConfig. */
@@ -196,6 +207,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, argv: readonly 
       port: readInt(env, 'QQ_EVENT_PORT', 8_790, 1, 65_535),
       path: normalizePath(readString(env, 'QQ_EVENT_PATH', '/onebot/events')),
       token: eventToken,
+      bindRetrySeconds: readInt(env, 'QQ_EVENT_BIND_RETRY_SECONDS', 0, 0, 86_400),
     }),
     inbox: Object.freeze({
       // Absolute at boot, never the raw env value: the server's working

@@ -17,12 +17,71 @@
  * Keep it alive however your platform prefers: a Windows scheduled task with
  * "run whether user is logged on or not", launchd, systemd, pm2, or a plain
  * terminal you leave open. `npm run receiver` starts it in the foreground.
+ *
+ * Set `QQ_EVENT_BIND_RETRY_SECONDS` to make it wait for the port instead of
+ * exiting when something already holds it. That matters at boot: the host's
+ * copy binds whenever the host starts and never retries, so a standalone copy
+ * that lost the race and exited would leave the port unowned the moment the
+ * host closes - the exact window this process exists to cover.
  */
 
-import { loadConfig } from '../config.js';
-import { createLogger } from '../core/logger.js';
-import { startEventServer } from '../events/server.js';
+import { createServer } from 'node:net';
+
+import { loadConfig, type AppConfig } from '../config.js';
+import { createLogger, type Logger } from '../core/logger.js';
+import { startEventServer, type EventServerHandle } from '../events/server.js';
+import type { Inbox } from '../inbox/store.js';
 import { buildDependencies } from '../server.js';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * Can we bind the port right now?
+ *
+ * Probed with a throwaway listener rather than by calling `startEventServer` in
+ * a loop: a failed `listen` leaves a Server object behind each time, and at a
+ * one-minute interval that is a slow leak measured in thousands per day.
+ */
+function portIsFree(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = createServer();
+    probe.once('error', () => resolve(false));
+    probe.once('listening', () => {
+      probe.close(() => resolve(true));
+    });
+    probe.listen(port, host);
+  });
+}
+
+async function bindWhenFree(config: AppConfig, logger: Logger, inbox: Inbox): Promise<EventServerHandle> {
+  const { enabled, host, port, bindRetrySeconds } = config.events;
+
+  // Retry disabled: one attempt, and the caller decides what a failure means.
+  if (!enabled || bindRetrySeconds <= 0) return startEventServer(config, logger, inbox);
+
+  let announced = false;
+  for (;;) {
+    if (await portIsFree(host, port)) {
+      const events = await startEventServer(config, logger, inbox);
+      if (events.url !== undefined) return events;
+      // Something took the port between the probe and the bind. Go round again
+      // rather than reporting a failure we can still recover from.
+    }
+    if (!announced) {
+      logger.warn('event port is held by another process; waiting for it', {
+        host,
+        port,
+        retrySeconds: bindRetrySeconds,
+      });
+      announced = true;
+    }
+    await sleep(bindRetrySeconds * 1000);
+  }
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -35,12 +94,12 @@ async function main(): Promise<void> {
   // touching the network, so a logged-out account does not stop the receiver
   // from collecting events.
   const deps = buildDependencies(config, logger);
-  const events = await startEventServer(config, logger, deps.inbox);
+  const events = await bindWhenFree(config, logger, deps.inbox);
 
   if (events.url === undefined) {
-    // Either the receiver is disabled by config, or something already holds the
-    // port. Both mean this process has no job to do, and exiting non-zero makes
-    // the failure visible to whatever supervisor started it.
+    // Either the receiver is disabled by config, or the port is held and
+    // retrying is switched off. Exiting non-zero makes the failure visible to
+    // whatever supervisor started it.
     logger.error(
       config.events.enabled
         ? 'receiver did not bind; another process already holds the event port'
