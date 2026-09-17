@@ -23,12 +23,21 @@
  * THE SECURITY POSTURE
  *
  * Anything that can POST here can put text into the model's context, which is
- * why an off-loopback bind requires a token at config time. The token check
- * itself is constant-time, and a rejection never echoes the expected value.
+ * why an off-loopback bind requires a token at config time. Whichever scheme the
+ * caller uses, the comparison is constant-time and a rejection never echoes the
+ * expected value.
+ *
+ * TWO SCHEMES, AND THE ONE THAT MATTERS IS THE ONE THAT IS EASY TO MISS
+ *
+ * `Authorization: Bearer <token>` is what a person or an agent reaches for, so
+ * it is what gets implemented first - and a receiver with only that rejects
+ * every real report, because OneBot's HTTP POST clients never send the token at
+ * all. They send `x-signature: sha1=<HMAC-SHA1 of the body, keyed by the token>`
+ * instead. See `signatureMatches`.
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { appendFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -73,11 +82,55 @@ function fingerprint(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 16);
 }
 
+/**
+ * Verify the signature OneBot's HTTP POST clients send instead of a token.
+ *
+ * This is the only scheme a real report ever uses, and it took a day to notice
+ * because it fails in the least informative way possible: 401. NapCat (and
+ * go-cqhttp before it) never puts the token on the wire. It signs the body:
+ *
+ *     x-signature: sha1=<hex HMAC-SHA1, keyed by the token, over the raw body>
+ *
+ * A receiver that only understands `Authorization: Bearer` rejects every single
+ * report - deterministically, with the exact status code that means "your token
+ * is wrong" - while the token is in fact correct. Bearer was accepted here and
+ * the OneBot scheme was not, which is precisely backwards.
+ *
+ * The body must be the raw bytes as sent; re-serialising the parsed JSON would
+ * change the bytes and the digest with them.
+ */
+function signatureMatches(header: string, token: string, body: string): boolean {
+  const prefix = 'sha1=';
+  if (!header.toLowerCase().startsWith(prefix)) return false;
+  const presented = header.slice(prefix.length).trim().toLowerCase();
+  const expected = createHmac('sha1', token).update(body, 'utf8').digest('hex');
+  return constantTimeEquals(presented, expected);
+}
+
 /** How the caller tried to authenticate, named without echoing the value. */
-function authScheme(req: IncomingMessage): 'bearer' | 'other' | 'absent' {
+function authScheme(req: IncomingMessage): 'bearer' | 'signature' | 'other' | 'absent' {
   const header = req.headers.authorization;
-  if (typeof header !== 'string') return 'absent';
-  return header.toLowerCase().startsWith('bearer ') ? 'bearer' : 'other';
+  if (typeof header === 'string') {
+    return header.toLowerCase().startsWith('bearer ') ? 'bearer' : 'other';
+  }
+  return typeof req.headers['x-signature'] === 'string' ? 'signature' : 'absent';
+}
+
+/**
+ * Does this request prove it is allowed to write into the queue?
+ *
+ * Two schemes, because the two ends of the world disagree about which is
+ * normal: agents and curl present the token, OneBot signs the body. Both are
+ * compared in constant time against the same secret.
+ */
+function isAuthorised(req: IncomingMessage, url: URL, token: string, body: string): boolean {
+  const presented = presentedToken(req, url);
+  if (presented !== undefined) return constantTimeEquals(presented, token);
+
+  const signature = req.headers['x-signature'];
+  if (typeof signature === 'string') return signatureMatches(signature, token, body);
+
+  return false;
 }
 
 /**
@@ -214,33 +267,41 @@ export async function startEventServer(config: AppConfig, logger: Logger, inbox:
       return;
     }
 
-    if (token !== undefined) {
-      const presented = presentedToken(req, url);
-      if (presented === undefined || !constantTimeEquals(presented, token)) {
-        // Recorded before responding: a rejection is the one event that is
-        // otherwise invisible from the outside, and the sender only ever sees
-        // "401", which says nothing about why.
-        recordRejection(config, {
-          ts: new Date().toISOString(),
-          event: 'rejected',
-          remote: req.socket.remoteAddress ?? 'unknown',
-          method: req.method,
-          path: url.pathname,
-          scheme: authScheme(req),
-          presentedLength: presented === undefined ? null : presented.length,
-          presentedFingerprint: presented === undefined ? null : fingerprint(presented),
-          expectedLength: token.length,
-          expectedFingerprint: fingerprint(token),
-        });
-        logger.warn('event report rejected: bad or missing token', { remote: req.socket.remoteAddress ?? 'unknown' });
-        respond(res, 401, 'unauthorized');
-        return;
-      }
-    }
-
+    // The body is read before the credential is checked, because one of the two
+    // accepted schemes signs the body instead of sending a secret. It is still
+    // not PARSED until the check passes: the size cap is what keeps an
+    // unauthenticated caller from making us buffer more than a report's worth.
     const read = await readBody(req);
     if (!read.ok) {
       respond(res, 413, 'payload too large');
+      return;
+    }
+
+    if (token !== undefined && !isAuthorised(req, url, token, read.body)) {
+      const presented = presentedToken(req, url);
+      const signature = req.headers['x-signature'];
+      // Recorded before responding: a rejection is the one event that is
+      // otherwise invisible from the outside, and the sender only ever sees
+      // "401", which says nothing about why.
+      recordRejection(config, {
+        ts: new Date().toISOString(),
+        event: 'rejected',
+        remote: req.socket.remoteAddress ?? 'unknown',
+        method: req.method,
+        path: url.pathname,
+        scheme: authScheme(req),
+        presentedLength: presented === undefined ? null : presented.length,
+        presentedFingerprint: presented === undefined ? null : fingerprint(presented),
+        // A signature that does not match can mean a wrong token OR a body that
+        // was altered in transit, so both halves of the input get recorded.
+        signatureLength: typeof signature === 'string' ? signature.length : null,
+        signatureFingerprint: typeof signature === 'string' ? fingerprint(signature) : null,
+        bodyBytes: Buffer.byteLength(read.body, 'utf8'),
+        expectedLength: token.length,
+        expectedFingerprint: fingerprint(token),
+      });
+      logger.warn('event report rejected: bad or missing token', { remote: req.socket.remoteAddress ?? 'unknown' });
+      respond(res, 401, 'unauthorized');
       return;
     }
 

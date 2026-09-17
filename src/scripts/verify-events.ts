@@ -20,6 +20,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHmac } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -175,6 +176,53 @@ async function main(): Promise<void> {
 
     const authorised = await post(url, groupMessage({ time: 1758096001 }), auth);
     check('an authorised report is accepted', authorised.status === 204, `got ${authorised.status}`);
+
+    // --- the scheme a real report actually uses -----------------------------
+    // OneBot's HTTP POST clients never put the token on the wire; they sign the
+    // body with it. A receiver that understands only Bearer therefore rejects
+    // EVERY real report with 401 - the one status that means "your token is
+    // wrong" - while the token is perfectly correct. This went unnoticed for a
+    // day because nothing else about the setup looked wrong.
+    //
+    // A heartbeat carries the tests: it is authenticated like any other report
+    // but never queued, so these assertions leave the queue counts below alone.
+    process.stderr.write('\nsigned reports (the scheme OneBot actually uses)\n');
+
+    const heartbeat = JSON.stringify({ post_type: 'meta_event', meta_event_type: 'heartbeat' });
+    const sign = (body: string, key: string = TOKEN): string =>
+      `sha1=${createHmac('sha1', key).update(body, 'utf8').digest('hex')}`;
+
+    const signed = await post(url, heartbeat, { 'x-signature': sign(heartbeat) });
+    check('a report signed with the token is accepted', signed.status === 204, `got ${signed.status}`);
+
+    const signedWithOtherKey = await post(url, heartbeat, { 'x-signature': sign(heartbeat, 'not-the-token') });
+    check(
+      'a signature keyed by a different token is rejected',
+      signedWithOtherKey.status === 401,
+      `got ${signedWithOtherKey.status}`,
+    );
+
+    // The signature covers the body, so swapping the body in transit has to fail
+    // even though the header is a valid signature of something.
+    const swappedBody = JSON.stringify({ post_type: 'meta_event', meta_event_type: 'lifecycle' });
+    const tampered = await post(url, swappedBody, { 'x-signature': sign(heartbeat) });
+    check(
+      'a signature that does not match the body is rejected',
+      tampered.status === 401,
+      `got ${tampered.status}`,
+    );
+
+    const unknownScheme = await post(url, heartbeat, { 'x-signature': 'md5=deadbeef' });
+    check('an unrecognised signature scheme is rejected', unknownScheme.status === 401, `got ${unknownScheme.status}`);
+
+    await sleep(100);
+    const signatureRejections = await readFile(join(dir, 'rejections.log'), 'utf8').catch(() => '');
+    check(
+      'a signature rejection is recorded as a signature, not as an absent token',
+      signatureRejections.includes('"scheme":"signature"') &&
+        signatureRejections.includes('"signatureFingerprint"'),
+      'the record does not distinguish a bad signature from no credential at all',
+    );
 
     // --- routing ------------------------------------------------------------
     process.stderr.write('\nrouting and body handling\n');

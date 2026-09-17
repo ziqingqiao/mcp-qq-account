@@ -326,9 +326,11 @@ schtasks /Create /TN "mcp-qq-account receiver" /SC ONLOGON /RL LIMITED /F `
 | OneBot 日志 | 含义 |
 |---|---|
 | `connect ECONNREFUSED 127.0.0.1:8790` | 端口上没人监听。接收器不在——宿主没开,或正在重启 |
-| `Unexpected status code: 401` | **有人在监听,但它认为 token 不对** |
+| `Unexpected status code: 401` | **有人在监听,但它不认这次请求的凭证** |
 
-第二种难查,因为它有两个相反的方向:**对方带错了 token**,或者**我们期望错了 token**。从外面看两者都是一句「401」,一模一样。
+**先看这一条:401 的第一嫌疑不是 token 配错,而是接收器不认识 OneBot 的签名方式**(见上文「两种鉴权方式」)。这种情况的特征是:**每一次上报都被拒,一次都不例外**,而且 token 各处都对。如果 401 是 100% 复现的,先查签名支持,别去比对 token。
+
+排除了签名之后,才轮到「谁带错了 token」——它有两个相反的方向:**对方带错了**,或者**我们期望错了**。从外面看两者都是一句「401」,一模一样。
 
 所以每次拒绝,接收器都会往队列目录写一行 `rejections.log`:
 
@@ -399,6 +401,31 @@ QQ_EVENT_HOST 不是回环地址 + QQ_EVENT_TOKEN 为空  →  拒绝启动
 
 不是警告,是拒绝。那个端点写进去的文字会直接进入模型上下文,暴露一个未鉴权的它,等于把注入面开放给整个网络。token 比较用常数时间实现。
 
+### 两种鉴权方式,而真正会被用到的那一种最容易漏
+
+| 方式 | 谁在用 | 形态 |
+| --- | --- | --- |
+| Bearer token | 人、`curl`、agent | `Authorization: Bearer <token>` |
+| **body 签名** | **OneBot 的 HTTP 上报客户端(即真实上报)** | `x-signature: sha1=<HMAC-SHA1(token, 原始 body)>` |
+
+**OneBot 的上报客户端根本不发 token。** NapCat(`napcat.mjs` 里的 HTTP Client 适配器)和更早的 go-cqhttp 都是这样:
+
+```js
+if (this.config.token) {
+  const s = createHmac("sha1", this.config.token);
+  s.update(body);                              // body = 事件 JSON 原文
+  headers["x-signature"] = "sha1=" + s.digest("hex");
+}
+```
+
+token 只作为 HMAC 的**密钥**,从不上线;签名覆盖 body 原文,所以它同时防篡改。
+
+**这就是「401 查了一整天」的答案。** 一个只实现了 Bearer 的接收器会把**每一次真实上报**都拒掉,而且拒得毫无信息量——401 恰好就是「你的 token 不对」的意思,于是所有排查都指向 token,而 token 从头到尾都是对的。现在两种都收。
+
+> 实现签名校验时,**必须拿收到的原始字节**去算摘要。把 body 解析成 JSON 再序列化回去,字节变了,摘要就不对了——这也正是签名要覆盖 body 的意义。
+>
+> 因为签名要用 body,而 Bearer 不需要,请求体现在**先读后验**。仍然**先验后解析**:大小上限挡住未鉴权方让服务端缓冲超量数据。
+
 ### 凭证永不作为工具参数
 
 `ONEBOT_ACCESS_TOKEN` 只在服务端读取。没有任何工具参数接受 token,模型**无法**选择、读取或泄露它。
@@ -418,7 +445,7 @@ npm run verify
 | 套件 | 覆盖 |
 | --- | --- |
 | `verify:inbox` | 去重(含「同 id 不同到达时间」)、读不消费、确认与归档、路径逃逸拒绝、截断、坏文件跳过、队列上限 |
-| `verify:events` | 真实 HTTP:token 鉴权、路径路由、超大与畸形 body、自己的消息被丢弃、心跳/通知/请求被忽略、私聊与群聊解析、图片配文回退、**拒绝被写进 `rejections.log` 且指纹化(不泄露 token 原文)**、**独立接收器抢输端口后不退出、并在端口释放后自动接管** |
+| `verify:events` | 真实 HTTP:token 鉴权、**OneBot 的 body 签名鉴权(`x-signature`)——正确密钥接受、换密钥拒绝、换 body 拒绝、未知签名算法拒绝**、路径路由、超大与畸形 body、自己的消息被丢弃、心跳/通知/请求被忽略、私聊与群聊解析、图片配文回退、**拒绝被写进 `rejections.log` 且指纹化(不泄露 token 原文)**、**独立接收器抢输端口后不退出、并在端口释放后自动接管** |
 | `verify:onebot` | 真实 HTTP(mock 上游):**`retcode` 非零在 HTTP 200 下必须报错**、`status:"failed"` 且 retcode 为 0 也必须报错、每个已映射 retcode 给出各自的可操作提示、未映射的也仍有提示、**文本以 segment 发送使 `[CQ:at,qq=all]` 保持字面**、大数 id 转字符串不丢精度、`remark` 优先于昵称、畸形上游降级为空表而非抛错、历史反转为最旧优先、不支持的实现明确说「不支持」而非泛化失败、凭证只在 header 不进 body、**重试策略:可重试状态码下写只尝试一次而读会重试、写失败必须说「送达未知」、明确拒绝不得被误标为不确定** |
 | `verify:tools` | 工具层真实 stdio:历史正文必须出现在**文本输出**里(而非只在结构化内容)、顺序仍是最旧优先、结构化内容同时保留、**未命中的 ack id 必须逐个点名而非只报数量**、发送回执可被引用、**文本以 segment 数组抵达 OneBot**、收件人 id 以字符串传递 |
 | `verify:http` | 真实 HTTP:无 token / 错 token 被 401 拒绝且不泄露 token、正确 token 握手成功、**两个传输暴露同一组 6 个工具**、服务器说明(不可信内容规则)在 HTTP 下同样送达、工具失败是 `isError` 而非协议错误、`QQ_SEND_ENABLED=false` 在这条路上同样被强制、`/healthz` 免鉴权但不泄露凭证、无密钥部署时端点确实开放(断言而非假设) |
@@ -440,6 +467,10 @@ npm run verify
 | `receiver.ts` 里改回「抢不到端口就退出」 | `FAIL` ×2 → **可被捕获** |
 | `tools.ts` 里 ack 文案改回只报未命中数量 | `FAIL` ×2 → **可被捕获** |
 | `client.ts` 里把发送的 `{ retry: false }` 去掉 | `FAIL` ×1（`attempts: 3`）→ **可被捕获** |
+| `server.ts` 里 `recordRejection(...)` 调用点短路 | `FAIL` ×3（「拒绝被记录」「指纹化不泄露原文」「记录 scheme」）→ **可被捕获** |
+| `server.ts` 里签名分支改回 `return false` | `FAIL` ×1（`a report signed with the token is accepted - got 401`）→ **可被捕获** |
+
+最后一条复现的正是生产故障本身:拒掉真实上报的那个 401。**它不是猜出来的,是先在生产日志里看到 401,再回去把实现补上、把断言钉住。**
 
 **一个永远不会失败的测试比没有测试更糟**——它会把「已经检查过了」这个错误结论卖给下一个读它的人。任何新增的安全相关断言都应当这样验一遍再提交。
 
