@@ -16,14 +16,16 @@
     "dev": "tsx watch src/index.ts",
     "start": "node --env-file-if-exists=.env dist/index.js",
     "start:http": "node --env-file-if-exists=.env dist/index.js --transport=http",
+    "receiver": "node --env-file-if-exists=.env dist/scripts/receiver.js",
     "smoke": "node dist/scripts/smoke.js",
     "audit:tools": "node dist/scripts/audit-tools.js",
     "verify:inbox": "node dist/scripts/verify-inbox.js",
     "verify:events": "node dist/scripts/verify-events.js",
     "verify:http": "node dist/scripts/verify-http.js",
     "verify:onebot": "node dist/scripts/verify-onebot.js",
+    "verify:tools": "node dist/scripts/verify-tools.js",
     "probe": "node --env-file-if-exists=.env dist/scripts/probe-onebot.js",
-    "verify": "npm run typecheck && npm run build && npm run verify:inbox && npm run verify:events && npm run verify:onebot && npm run verify:http && npm run smoke && npm run audit:tools"
+    "verify": "npm run typecheck && npm run build && npm run verify:inbox && npm run verify:events && npm run verify:onebot && npm run verify:tools && npm run verify:http && npm run smoke && npm run audit:tools"
   },
   "dependencies": {
     "@modelcontextprotocol/express": "^2.0.0",

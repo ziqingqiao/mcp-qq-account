@@ -236,7 +236,7 @@ npm run verify
 | `QQ_EVENT_PORT` | `8790` | 事件接收器端口 |
 | `QQ_EVENT_PATH` | `/onebot/events` | 事件接收器路径 |
 | `QQ_EVENT_TOKEN` | 空 | 上报鉴权。**绑定非回环地址时必填,否则拒绝启动** |
-| `QQ_INBOX_DIR` | `./inbox-data` | 消息队列目录 |
+| `QQ_INBOX_DIR` | `<cwd>/inbox-data` | 消息队列目录。**部署时务必写成绝对路径**,见下文 |
 | `QQ_INBOX_MAX_BATCH` | `50` | 一次读取的上限 |
 | `QQ_SEND_ENABLED` | `true` | **运维开关**:设为 `false` 则只读不发 |
 | `HTTP_HOST` / `HTTP_PORT` / `HTTP_PATH` | `127.0.0.1` / `3000` / `/mcp` | MCP 的 HTTP 传输 |
@@ -255,6 +255,40 @@ QQ_SEND_ENABLED=false
 ```
 
 读消息、看历史照常工作;`qq_send_message` 会返回一条明确的「被运维禁用,重试无用」的错误。观察够了再打开。
+
+### 收件箱目录要写绝对路径
+
+`QQ_INBOX_DIR` 留空时会落到 `<当前工作目录>/inbox-data`。宿主启动 MCP 服务时的工作目录,取决于**你当时打开的是哪个项目文件夹**——所以留空意味着队列会跟着工作目录漂移:接收器往 A 目录写,模型从 B 目录读,两边都认为自己看到的是全部,而实际上对方的消息永远看不见。
+
+这类故障不会报错,只会表现为「消息莫名其妙少了」。写绝对路径即可:
+
+```bash
+QQ_INBOX_DIR=/absolute/path/to/inbox-data
+```
+
+宿主的 MCP 配置(`env`)和 `.env` 是**两份独立来源**,两处都要写,且必须一致。
+
+### 接收器不在时,消息是真的会丢
+
+MCP 服务启动时会顺带起一个事件接收器,但**它只活在 MCP 进程的生命周期里**。桌面宿主一天里大部分时间是关着的,那段时间端口上没人监听——而 OneBot **不缓冲也不重试**上报失败,它记一条 `connect ECONNREFUSED` 就继续走了。
+
+后果是:那段时间收到的消息**永远不会进队列**。它还在 QQ 自己的聊天记录里,但任何工具都取不到,也就永远等不到回复。
+
+```
+20:47:23 [info]  接收 <- 私聊 (100000001) <对方发来的内容>
+20:47:23 [error] [Http Client] 新消息事件HTTP上报返回快速操作失败
+                 Error: connect ECONNREFUSED 127.0.0.1:8790
+```
+
+如果你需要「人不在也要收着」,把接收器单独常驻:
+
+```bash
+npm run receiver
+```
+
+它只做一件事:占住端口、把事件写进同一个队列。MCP 服务随后会发现端口被占,记一条 warn 然后**照常读同一个队列**——这是设计好的分工,不是冲突。
+
+常驻方式随平台:Windows 计划任务(勾「不管用户是否登录都运行」)、launchd、systemd、pm2,或者干脆留一个终端窗口开着。
 
 ---
 
@@ -307,6 +341,7 @@ npm run verify
 | `verify:inbox` | 去重(含「同 id 不同到达时间」)、读不消费、确认与归档、路径逃逸拒绝、截断、坏文件跳过、队列上限 |
 | `verify:events` | 真实 HTTP:token 鉴权、路径路由、超大与畸形 body、自己的消息被丢弃、心跳/通知/请求被忽略、私聊与群聊解析、图片配文回退 |
 | `verify:onebot` | 真实 HTTP(mock 上游):**`retcode` 非零在 HTTP 200 下必须报错**、`status:"failed"` 且 retcode 为 0 也必须报错、每个已映射 retcode 给出各自的可操作提示、未映射的也仍有提示、**文本以 segment 发送使 `[CQ:at,qq=all]` 保持字面**、大数 id 转字符串不丢精度、`remark` 优先于昵称、畸形上游降级为空表而非抛错、历史反转为最旧优先、不支持的实现明确说「不支持」而非泛化失败、凭证只在 header 不进 body |
+| `verify:tools` | 工具层真实 stdio:历史正文必须出现在**文本输出**里(而非只在结构化内容)、顺序仍是最旧优先、结构化内容同时保留、发送回执可被引用、**文本以 segment 数组抵达 OneBot**、收件人 id 以字符串传递 |
 | `verify:http` | 真实 HTTP:无 token / 错 token 被 401 拒绝且不泄露 token、正确 token 握手成功、**两个传输暴露同一组 6 个工具**、服务器说明(不可信内容规则)在 HTTP 下同样送达、工具失败是 `isError` 而非协议错误、`QQ_SEND_ENABLED=false` 在这条路上同样被强制、`/healthz` 免鉴权但不泄露凭证、无密钥部署时端点确实开放(断言而非假设) |
 | `smoke` | 协议握手、版本协商、stdout 纯净性、**服务器说明里必须含不可信内容规则** |
 | `audit:tools` | 工具契约:命名、描述长度与消歧、参数 `.describe()` 全覆盖、数值上限写进描述、四个 annotations、写工具说明后果、参数名不得含凭证字样 |
@@ -322,6 +357,7 @@ npm run verify
 | `transports/http.ts` 里挂载 `requireBearerAuth` 的条件改成永假 | `FAIL ... got 200` ×2 → **可被捕获** |
 | `client.ts` 里 `if (retcode !== 0 ...)` 改成永假 | `FAIL` ×7 → **可被捕获** |
 | `client.ts` 里 `textSegment()` 改成直接返回字符串 | `FAIL` ×4 → **可被捕获** |
+| `tools.ts` 里历史摘要改回只报计数 | `FAIL` ×3 → **可被捕获** |
 
 **一个永远不会失败的测试比没有测试更糟**——它会把「已经检查过了」这个错误结论卖给下一个读它的人。任何新增的安全相关断言都应当这样验一遍再提交。
 
@@ -336,6 +372,8 @@ npm run verify
 | `npm run probe` 报 no usable account session | OneBot 的 HTTP 服务没开,或账号没登录 |
 | 启动即 `Configuration error: QQ_EVENT_TOKEN is required` | 绑定了非回环地址却没设 token |
 | 日志出现 `event receiver could not bind` | 端口被另一个宿主拉起的实例占用。**不是故障**:队列是共享目录,后启动的实例仍能读全部消息 |
+| OneBot 日志有 `接收 <- 私聊 (...)` ,但队列里查不到 | 上报时接收器不在(常见于宿主没开)。OneBot 不重试,这条消息已经丢了——用 `npm run receiver` 常驻可避免。**注意它可能还在 QQ 本地历史里**,可用 `qq_get_conversation_history` 捞回来 |
+| 消息时有时无,像是漏了一批 | `QQ_INBOX_DIR` 没写绝对路径,队列跟着工作目录漂移了 |
 | 群里有人发消息但 `qq_read_messages` 是空的 | OneBot 的「HTTP 上报」没配,或地址/端口与本服务不一致 |
 | 消息被读了两遍 | `qq_read_messages` 不消费。读完要调 `qq_ack_messages` |
 | `qq_send_message` 报 sending is disabled | `QQ_SEND_ENABLED=false`,重试无用 |
@@ -375,7 +413,9 @@ src/
     ├── verify-inbox.ts       队列机制验证
     ├── verify-events.ts      事件接收器验证
     ├── verify-onebot.ts      OneBot 适配层验证(mock 上游:retcode、分段、历史顺序)
+    ├── verify-tools.ts       工具层验证(真实 stdio:文本输出里到底有没有正文)
     ├── verify-http.ts        HTTP 传输验证(鉴权、工具一致性、kill switch)
+    ├── receiver.ts           独立事件接收器:宿主关着也能收消息
     └── probe-onebot.ts       上游连通性探测
 ```
 
