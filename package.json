@@ -24,8 +24,10 @@
     "verify:http": "node dist/scripts/verify-http.js",
     "verify:onebot": "node dist/scripts/verify-onebot.js",
     "verify:tools": "node dist/scripts/verify-tools.js",
+    "verify:losses": "node dist/scripts/verify-losses.js",
     "probe": "node --env-file-if-exists=.env dist/scripts/probe-onebot.js",
-    "verify": "npm run typecheck && npm run build && npm run verify:inbox && npm run verify:events && npm run verify:onebot && npm run verify:tools && npm run verify:http && npm run smoke && npm run audit:tools"
+    "losses": "node --env-file-if-exists=.env dist/scripts/report-losses.js",
+    "verify": "npm run typecheck && npm run build && npm run verify:inbox && npm run verify:events && npm run verify:onebot && npm run verify:tools && npm run verify:http && npm run verify:losses && npm run smoke && npm run audit:tools"
   },
   "dependencies": {
     "@modelcontextprotocol/express": "^2.0.0",

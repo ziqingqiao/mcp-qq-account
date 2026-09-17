@@ -158,9 +158,9 @@ npm run probe
 npm run verify
 ```
 
-七个套件依次跑:类型检查、构建、**收件箱机制验证**、**事件接收器验证**、**OneBot 适配层验证**、**HTTP 传输验证**、传输冒烟、工具契约审计。
+八个套件依次跑:类型检查、构建、**收件箱机制验证**、**事件接收器验证**、**OneBot 适配层验证**、**HTTP 传输验证**、**丢消息取证验证**、传输冒烟、工具契约审计。
 
-中间四个是重点——它们用**真实的 HTTP 请求打真实的监听端口**,验证的是「重复投递会不会存两条」「自己的消息会不会被当成别人发的」「token 错了会不会被拒」「HTTP 端点在没鉴权时会不会被拒」「retcode 非零会不会被当成成功」这类**错了也不会报错**的地方。
+中间五个是重点——它们用**真实的 HTTP 请求打真实的监听端口**,验证的是「重复投递会不会存两条」「自己的消息会不会被当成别人发的」「token 错了会不会被拒」「HTTP 端点在没鉴权时会不会被拒」「retcode 非零会不会被当成成功」「日志里的失败会不会被归到错误的收信人头上」这类**错了也不会报错**的地方。
 
 > 只有 stdio 一路是宿主实际在用的(见 `clients/`),但 HTTP 传输是**部署在共享环境时才会用到**的那条路,而它一旦配错,暴露的是包括 `qq_send_message` 在内的全部工具。所以它有独立的验证套件,不是附赠。
 >
@@ -369,6 +369,39 @@ wmic process where "name='node.exe'" get processid,commandline | findstr receive
 
 `verify:events` 覆盖了它:既断言拒绝被记下,也断言**记录里不含 token 原文**。
 
+### 有没有丢消息:`npm run losses`
+
+收件箱为空是**无法自证**的:没送到的消息在队列里不留任何痕迹,所以「没人给你发」和「全丢了」看起来一模一样。唯一的记录在实现自己的日志里。
+
+```bash
+npm run losses                            # 读最新的那个日志
+npm run losses -- --since "09-17 22:25"   # 只看某个时间之后
+npm run losses -- --fail-on-loss          # 有丢失就返回非零退出码
+```
+
+需要 `ONEBOT_LOG_DIR` 指向日志目录(见 `.env.example`)。输出:
+
+```
+received        : 12
+lost            : 10
+no failure      : 2
+
+lost messages (the upstream recorded a failed report for each):
+  09-17 20:47:23  private (200000001)  "..."
+                nothing was listening on the report port
+                connect ECONNREFUSED 127.0.0.1:8790
+```
+
+**`lost` 是事实,`no failure` 不是「已送达」。** 这类实现**只在失败时写日志,成功不写** —— 于是「上报成功」和「压根没尝试上报」在日志里长得一模一样。`no failure` 只意味着「没有证据表明它丢了」,不意味着「它到了」。工具的措辞刻意如此,零丢失时也会把这句话说出来。
+
+实测就撞上过这种情形:两条 `临时消息` 既没有失败行,也不在队列里 —— 因为 NapCat 根本没有上报它们。
+
+> **判据只能顺着一个方向用:「有失败行」⇒ 丢了。反过来把「没有失败行」当成功,就会得到一份把丢失认证成健康的报告。**
+
+丢了的消息**在队列层找不回来**(OneBot 不缓冲、不重试),但**仍在 QQ 自己的历史里** —— 用 `qq_get_conversation_history` 能读回来。
+
+`verify:losses` 覆盖了它:29 条断言,大半在验**归因** —— 哪个失败属于哪条消息、哪个失败不属于任何消息。多归因会凭空造出丢失,少归因会藏起丢失。另有一组断言专门盯措辞:**不允许把 `no failure` 说成 `delivered`**,尤其是零丢失那种最想让人放心的情形。
+
 ---
 
 ## 安全模型
@@ -470,6 +503,7 @@ npm run verify
 | `verify:onebot` | 真实 HTTP(mock 上游):**`retcode` 非零在 HTTP 200 下必须报错**、`status:"failed"` 且 retcode 为 0 也必须报错、每个已映射 retcode 给出各自的可操作提示、未映射的也仍有提示、**文本以 segment 发送使 `[CQ:at,qq=all]` 保持字面**、大数 id 转字符串不丢精度、`remark` 优先于昵称、畸形上游降级为空表而非抛错、历史反转为最旧优先、不支持的实现明确说「不支持」而非泛化失败、凭证只在 header 不进 body、**重试策略:可重试状态码下写只尝试一次而读会重试、写失败必须说「送达未知」、明确拒绝不得被误标为不确定** |
 | `verify:tools` | 工具层真实 stdio:历史正文必须出现在**文本输出**里(而非只在结构化内容)、顺序仍是最旧优先、结构化内容同时保留、**未命中的 ack id 必须逐个点名而非只报数量**、发送回执可被引用、**文本以 segment 数组抵达 OneBot**、收件人 id 以字符串传递 |
 | `verify:http` | 真实 HTTP:无 token / 错 token 被 401 拒绝且不泄露 token、正确 token 握手成功、**两个传输暴露同一组 6 个工具**、服务器说明(不可信内容规则)在 HTTP 下同样送达、工具失败是 `isError` 而非协议错误、`QQ_SEND_ENABLED=false` 在这条路上同样被强制、`/healthz` 免鉴权但不泄露凭证、无密钥部署时端点确实开放(断言而非假设) |
+| `verify:losses` | 日志解析与**归因**:每个收到的消息都被计入、只有带失败行的才算丢、`ECONNREFUSED` 与 `401` 给不同的解释、原始文本必须保留、**别的子系统的错误不算投递失败**、**离得太远的失败行不得归给前面的消息**、**同一条消息只算丢一次且保留第一个解释**、颜色码不遮挡、四种会话类型、无 id 的消息、时间窗口过滤;**命令行**:没配日志目录要报错而非报 0、空目录要报错、读最新而非最旧的那个日志、`--since` 真的收窄了窗口、`--fail-on-loss` 的退出码、**零丢失时不得声称「全部送达」** |
 | `smoke` | 协议握手、版本协商、stdout 纯净性、**服务器说明里必须含不可信内容规则** |
 | `audit:tools` | 工具契约:命名、描述长度与消歧、参数 `.describe()` 全覆盖、数值上限写进描述、四个 annotations、写工具说明后果、参数名不得含凭证字样 |
 
@@ -490,8 +524,13 @@ npm run verify
 | `client.ts` 里把发送的 `{ retry: false }` 去掉 | `FAIL` ×1（`attempts: 3`）→ **可被捕获** |
 | `server.ts` 里 `recordRejection(...)` 调用点短路 | `FAIL` ×3（「拒绝被记录」「指纹化不泄露原文」「记录 scheme」）→ **可被捕获** |
 | `server.ts` 里签名分支改回 `return false` | `FAIL` ×1（`a report signed with the token is accepted - got 401`）→ **可被捕获** |
+| `delivery-log.ts` 里归因窗口 `2` 改成 `9999` | `FAIL` ×1（`an error that names no HTTP report is not a delivery loss - got 1`）→ **可被捕获** |
+| `delivery-log.ts` 里 401 的解释改成和 `ECONNREFUSED` 同一句 | `FAIL` ×1（`a 401 is named as a credential mismatch... - nothing was listening on the report port`）→ **可被捕获** |
+| `delivery-log.ts` 里去掉「只归因一次」的守卫 | `FAIL` ×1（`a message is only lost once, and keeps the first explanation - detail=Unexpected status code: 401`）→ **可被捕获** |
 
-最后一条复现的正是生产故障本身:拒掉真实上报的那个 401。**它不是猜出来的,是先在生产日志里看到 401,再回去把实现补上、把断言钉住。**
+倒数第四条复现的正是生产故障本身:拒掉真实上报的那个 401。**它不是猜出来的,是先在生产日志里看到 401,再回去把实现补上、把断言钉住。**
+
+最后三条守的是同一件事的两面:**归因错了,报告就会撒谎** —— 多归因凭空造出丢失,少归因把丢失藏起来。而这份报告是回答「有没有丢消息」的唯一仪器。
 
 **一个永远不会失败的测试比没有测试更糟**——它会把「已经检查过了」这个错误结论卖给下一个读它的人。任何新增的安全相关断言都应当这样验一遍再提交。
 
@@ -507,6 +546,7 @@ npm run verify
 | 启动即 `Configuration error: QQ_EVENT_TOKEN is required` | 绑定了非回环地址却没设 token |
 | 日志出现 `event receiver could not bind` | 端口被另一个宿主拉起的实例占用。**不是故障**:队列是共享目录,后启动的实例仍能读全部消息 |
 | OneBot 日志有 `接收 <- 私聊 (...)` ,但队列里查不到 | 上报时接收器不在(常见于宿主没开)。OneBot 不重试,这条消息已经丢了——用 `npm run receiver` 常驻可避免。**注意它可能还在 QQ 本地历史里**,可用 `qq_get_conversation_history` 捞回来 |
+| 想知道到底丢了哪些、什么时候丢的 | `npm run losses` —— 直接读实现的日志,列出**它自己承认上报失败**的每一条,并区分「没人监听」和「被拒」 |
 | 消息时有时无,像是漏了一批 | `QQ_INBOX_DIR` 没写绝对路径,队列跟着工作目录漂移了 |
 | 群里有人发消息但 `qq_read_messages` 是空的 | OneBot 的「HTTP 上报」没配,或地址/端口与本服务不一致 |
 | 消息被读了两遍 | `qq_read_messages` 不消费。读完要调 `qq_ack_messages` |
@@ -533,6 +573,7 @@ src/
 ├── providers/
 │   └── onebot/
 │       ├── client.ts         OneBot 11 适配层(不含任何 MCP 概念)
+│       ├── delivery-log.ts   读实现自己的日志,回答「有没有消息丢了」
 │       └── tools.ts          工具定义(面向意图,而非一一映射 API)
 ├── inbox/
 │   └── store.ts              入站消息队列:去重、读不消费、确认归档、有界
@@ -540,9 +581,6 @@ src/
 │   └── server.ts             OneBot 事件接收端点(鉴权 + 解析 + 入队 + 拒绝取证)
 ├── transports/
 │   └── http.ts               Streamable HTTP + Bearer 鉴权
-├── start-receiver.bat        双击即可常驻独立接收器,输出留在前台(Windows)
-├── start-receiver-boot.bat   同上,输出追加到 receiver.log,供开机自启用
-├── startup-entry.bat         复制到 shell:startup 即开机自启(最小化后立即返回)
 └── scripts/
     ├── lib/stdio-session.ts  可复用 stdio 会话(裸线协议)
     ├── smoke.ts              传输层冒烟(stdio)
@@ -552,8 +590,14 @@ src/
     ├── verify-onebot.ts      OneBot 适配层验证(mock 上游:retcode、分段、历史顺序)
     ├── verify-tools.ts       工具层验证(真实 stdio:文本输出里到底有没有正文)
     ├── verify-http.ts        HTTP 传输验证(鉴权、工具一致性、kill switch)
+    ├── verify-losses.ts      丢消息取证的归因与措辞验证
     ├── receiver.ts           独立事件接收器:宿主关着也能收消息,端口被占则等待接管
+    ├── report-losses.ts      丢消息取证:读实现日志,列出确认丢失的那些
     └── probe-onebot.ts       上游连通性探测
+
+start-receiver.bat            双击即可常驻独立接收器,输出留在前台(Windows)
+start-receiver-boot.bat       同上,输出追加到 receiver.log,供开机自启用
+startup-entry.bat             复制到 shell:startup 即开机自启(最小化后立即返回)
 ```
 
 ---
