@@ -28,7 +28,9 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { appendFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import type { AppConfig } from '../config.js';
 import type { Logger } from '../core/logger.js';
@@ -56,6 +58,42 @@ function constantTimeEquals(candidate: string, expected: string): boolean {
     return false;
   }
   return timingSafeEqual(a, b);
+}
+
+/**
+ * A short, non-reversible fingerprint of a token.
+ *
+ * A 401 has exactly one interesting explanation - the sender presented a token
+ * we did not expect - and the obvious way to check that is to look at both
+ * values. That would put a live credential in a log file, which is worse than
+ * the outage. A truncated hash answers the only question that matters (same or
+ * different?) without being usable as the credential itself.
+ */
+function fingerprint(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 16);
+}
+
+/** How the caller tried to authenticate, named without echoing the value. */
+function authScheme(req: IncomingMessage): 'bearer' | 'other' | 'absent' {
+  const header = req.headers.authorization;
+  if (typeof header !== 'string') return 'absent';
+  return header.toLowerCase().startsWith('bearer ') ? 'bearer' : 'other';
+}
+
+/**
+ * Append one line per rejection to a file next to the queue.
+ *
+ * The logger is not enough on its own. Which stream a host captures, and
+ * whether it captures one at all, varies - this process has run for hours
+ * without a single line reaching the host's log - so a rejection that is only
+ * logged can be invisible exactly when it matters. The queue directory is
+ * already the one place both sides agree on, so the record goes there.
+ *
+ * Never fatal: failing to write a diagnostic must not turn a 401 into a 500.
+ */
+function recordRejection(config: AppConfig, entry: Record<string, unknown>): void {
+  const line = `${JSON.stringify(entry)}\n`;
+  void appendFile(join(config.inbox.dir, 'rejections.log'), line, 'utf8').catch(() => undefined);
 }
 
 function presentedToken(req: IncomingMessage, url: URL): string | undefined {
@@ -179,6 +217,21 @@ export async function startEventServer(config: AppConfig, logger: Logger, inbox:
     if (token !== undefined) {
       const presented = presentedToken(req, url);
       if (presented === undefined || !constantTimeEquals(presented, token)) {
+        // Recorded before responding: a rejection is the one event that is
+        // otherwise invisible from the outside, and the sender only ever sees
+        // "401", which says nothing about why.
+        recordRejection(config, {
+          ts: new Date().toISOString(),
+          event: 'rejected',
+          remote: req.socket.remoteAddress ?? 'unknown',
+          method: req.method,
+          path: url.pathname,
+          scheme: authScheme(req),
+          presentedLength: presented === undefined ? null : presented.length,
+          presentedFingerprint: presented === undefined ? null : fingerprint(presented),
+          expectedLength: token.length,
+          expectedFingerprint: fingerprint(token),
+        });
         logger.warn('event report rejected: bad or missing token', { remote: req.socket.remoteAddress ?? 'unknown' });
         respond(res, 401, 'unauthorized');
         return;

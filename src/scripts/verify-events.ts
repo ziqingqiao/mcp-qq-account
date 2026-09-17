@@ -20,7 +20,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -148,6 +148,27 @@ async function main(): Promise<void> {
 
     const wrongToken = await post(url, groupMessage(), { Authorization: 'Bearer nope' });
     check('a report with a wrong token is rejected', wrongToken.status === 401, `got ${wrongToken.status}`);
+
+    // A 401 is the only event the sender cannot explain, and the receiver is
+    // the only side that can. Without this record, "the sender used the wrong
+    // token" and "we are expecting the wrong token" look identical from the
+    // outside - which is exactly the state this receiver was in for a day.
+    await sleep(100);
+    const rejections = await readFile(join(dir, 'rejections.log'), 'utf8').catch(() => '');
+    check('a rejected report is recorded', rejections.includes('"event":"rejected"'), 'nothing was written');
+    check(
+      'the record fingerprints the tokens rather than printing them',
+      rejections.includes('"presentedFingerprint"') &&
+        rejections.includes('"expectedFingerprint"') &&
+        !rejections.includes(TOKEN) &&
+        !rejections.includes('nope'),
+      'the record either lacks fingerprints or leaks a token value',
+    );
+    check(
+      'the record names how the caller authenticated',
+      rejections.includes('"scheme":"bearer"') && rejections.includes('"scheme":"absent"'),
+      'scheme was not recorded for both the wrong-token and no-token cases',
+    );
 
     const queryToken = await post(`${url}?access_token=${TOKEN}`, groupMessage({ message_id: 1002, time: 1758096002 }));
     check('a token in the query string is accepted', queryToken.status === 204, `got ${queryToken.status}`);

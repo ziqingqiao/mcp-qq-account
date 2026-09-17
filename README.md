@@ -305,6 +305,47 @@ schtasks /Create /TN "mcp-qq-account receiver" /SC ONLOGON /RL LIMITED /F `
 
 `--env-file-if-exists=.env` 是必需的:计划任务的工作目录不是项目目录,不显式指定就读不到 `QQ_INBOX_DIR` 和重试间隔。**注意路径不要带中文**,否则 `.cmd` 包装层会因代码页问题读不到文件。
 
+不想碰计划任务,就双击项目根目录的 `start-receiver.bat`——它做的是同一件事,只是把窗口留在前台。
+
+### 宿主会把 MCP 服务反复重启
+
+桌面宿主自己崩溃重启时,它拉起的 MCP 服务跟着一起死,端口就空出来。实测这台机器上的宿主每隔几分钟就 `exit:1` 一次:
+
+```
+21:26:18  child_process_crash  Child process gone (cli): reason=exit:1, exitCode=1
+21:28:25  child_process_crash  Child process gone (cli): reason=exit:1, exitCode=1
+21:30:22  child_process_crash  Child process gone (cli): reason=exit:1, exitCode=1
+```
+
+每一次重启都是一段 `ECONNREFUSED` 窗口。这和「宿主一天里大部分时间关着」是同一个问题,只是频率高得多——它把「接收器常驻」从**可选**变成了**必需**。
+
+### 401:上报被拒绝时,得看得到原因
+
+上报失败有两种形态,含义完全不同:
+
+| OneBot 日志 | 含义 |
+|---|---|
+| `connect ECONNREFUSED 127.0.0.1:8790` | 端口上没人监听。接收器不在——宿主没开,或正在重启 |
+| `Unexpected status code: 401` | **有人在监听,但它认为 token 不对** |
+
+第二种难查,因为它有两个相反的方向:**对方带错了 token**,或者**我们期望错了 token**。从外面看两者都是一句「401」,一模一样。
+
+所以每次拒绝,接收器都会往队列目录写一行 `rejections.log`:
+
+```json
+{"ts":"...","event":"rejected","remote":"127.0.0.1","scheme":"bearer",
+ "presentedLength":32,"presentedFingerprint":"2c787c5bd0695b86",
+ "expectedLength":32,"expectedFingerprint":"2c787c5bd0695b86"}
+```
+
+**两个指纹相同** → 不是 token 的问题,那个 401 来自别处。**不同** → 对方带的是另一个 token,去比对它的配置。
+
+写的是 SHA-256 的前 16 位,不是 token 本身:日志不该存活的凭据,而「一样还是不一样」是这里唯一需要回答的问题。
+
+这份记录**不经过 logger,直接落盘**。宿主对 MCP 服务 stderr 的采集时有时无——实测有进程连续跑了几小时,宿主日志里一行都没留下——只靠日志的拒绝记录,可能恰好在最需要的时候看不见。
+
+`verify:events` 覆盖了它:既断言拒绝被记下,也断言**记录里不含 token 原文**。
+
 ---
 
 ## 安全模型
@@ -377,7 +418,7 @@ npm run verify
 | 套件 | 覆盖 |
 | --- | --- |
 | `verify:inbox` | 去重(含「同 id 不同到达时间」)、读不消费、确认与归档、路径逃逸拒绝、截断、坏文件跳过、队列上限 |
-| `verify:events` | 真实 HTTP:token 鉴权、路径路由、超大与畸形 body、自己的消息被丢弃、心跳/通知/请求被忽略、私聊与群聊解析、图片配文回退、**独立接收器抢输端口后不退出、并在端口释放后自动接管** |
+| `verify:events` | 真实 HTTP:token 鉴权、路径路由、超大与畸形 body、自己的消息被丢弃、心跳/通知/请求被忽略、私聊与群聊解析、图片配文回退、**拒绝被写进 `rejections.log` 且指纹化(不泄露 token 原文)**、**独立接收器抢输端口后不退出、并在端口释放后自动接管** |
 | `verify:onebot` | 真实 HTTP(mock 上游):**`retcode` 非零在 HTTP 200 下必须报错**、`status:"failed"` 且 retcode 为 0 也必须报错、每个已映射 retcode 给出各自的可操作提示、未映射的也仍有提示、**文本以 segment 发送使 `[CQ:at,qq=all]` 保持字面**、大数 id 转字符串不丢精度、`remark` 优先于昵称、畸形上游降级为空表而非抛错、历史反转为最旧优先、不支持的实现明确说「不支持」而非泛化失败、凭证只在 header 不进 body、**重试策略:可重试状态码下写只尝试一次而读会重试、写失败必须说「送达未知」、明确拒绝不得被误标为不确定** |
 | `verify:tools` | 工具层真实 stdio:历史正文必须出现在**文本输出**里(而非只在结构化内容)、顺序仍是最旧优先、结构化内容同时保留、**未命中的 ack id 必须逐个点名而非只报数量**、发送回执可被引用、**文本以 segment 数组抵达 OneBot**、收件人 id 以字符串传递 |
 | `verify:http` | 真实 HTTP:无 token / 错 token 被 401 拒绝且不泄露 token、正确 token 握手成功、**两个传输暴露同一组 6 个工具**、服务器说明(不可信内容规则)在 HTTP 下同样送达、工具失败是 `isError` 而非协议错误、`QQ_SEND_ENABLED=false` 在这条路上同样被强制、`/healthz` 免鉴权但不泄露凭证、无密钥部署时端点确实开放(断言而非假设) |
@@ -444,9 +485,10 @@ src/
 ├── inbox/
 │   └── store.ts              入站消息队列:去重、读不消费、确认归档、有界
 ├── events/
-│   └── server.ts             OneBot 事件接收端点(鉴权 + 解析 + 入队)
+│   └── server.ts             OneBot 事件接收端点(鉴权 + 解析 + 入队 + 拒绝取证)
 ├── transports/
 │   └── http.ts               Streamable HTTP + Bearer 鉴权
+├── start-receiver.bat        双击即可常驻独立接收器(Windows)
 └── scripts/
     ├── lib/stdio-session.ts  可复用 stdio 会话(裸线协议)
     ├── smoke.ts              传输层冒烟(stdio)
