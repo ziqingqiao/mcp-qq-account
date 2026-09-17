@@ -1,0 +1,41 @@
+{
+  "name": "mcp-qq-account",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server that exposes a personal QQ account (via an OneBot-compatible implementation) as model-facing tools, so an agent can read and send messages as that account.",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "mcp-qq-account": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch src/index.ts",
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "start:http": "node --env-file-if-exists=.env dist/index.js --transport=http",
+    "smoke": "node dist/scripts/smoke.js",
+    "audit:tools": "node dist/scripts/audit-tools.js",
+    "verify:inbox": "node dist/scripts/verify-inbox.js",
+    "verify:events": "node dist/scripts/verify-events.js",
+    "verify:http": "node dist/scripts/verify-http.js",
+    "verify:onebot": "node dist/scripts/verify-onebot.js",
+    "probe": "node --env-file-if-exists=.env dist/scripts/probe-onebot.js",
+    "verify": "npm run typecheck && npm run build && npm run verify:inbox && npm run verify:events && npm run verify:onebot && npm run verify:http && npm run smoke && npm run audit:tools"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/express": "^2.0.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "express": "^5.1.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

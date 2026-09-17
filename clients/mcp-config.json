@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "qq-account": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/mcp-qq-account/dist/index.js"
+      ],
+      "env": {
+        "ONEBOT_BASE_URL": "http://127.0.0.1:3000",
+        "QQ_EVENT_PORT": "8790",
+        "QQ_EVENT_TOKEN": "<generate-a-random-string>",
+        "QQ_SEND_ENABLED": "false",
+        "LOG_LEVEL": "info"
+      }
+    }
+  }
+}

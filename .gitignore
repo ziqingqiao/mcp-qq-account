@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+
+# The inbox holds the text of messages other people sent. It is runtime state,
+# not source: it must never be committed.
+inbox-data/
+
+# Agent scratch space: session notes that routinely quote live tokens and
+# account ids. Local only.
+.workbuddy-ai/
