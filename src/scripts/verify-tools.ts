@@ -86,7 +86,9 @@ function startMock(): Promise<{ server: Server; url: string; calls: RecordedCall
           case 'send_private_msg':
             return { message_id: 424242 };
           case 'get_login_info':
-            return { user_id: 1324760874, nickname: 'qq大王' };
+            // Deliberately synthetic: this file is published, and a real account
+            // id in a mock is a leak with no upside. Nothing asserts on it.
+            return { user_id: 10001, nickname: 'Test Account' };
           default:
             return {};
         }

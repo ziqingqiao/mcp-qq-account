@@ -11,11 +11,14 @@ REM This process keeps the report port bound around the clock instead. Leave the
 REM window open. The MCP tools keep working either way: the queue is a shared
 REM directory, so the server reads whatever this process receives.
 REM
-REM Double-click to run in the foreground, or put a shortcut to this file in
+REM Double-click to run in the foreground, or put a copy of startup-entry.bat in
 REM shell:startup to have it come up with Windows.
+REM
+REM Edit the node path below if your Node lives elsewhere. %USERPROFILE% is used
+REM rather than a literal path so this file carries no machine-specific name.
 REM ---------------------------------------------------------------------------
 cd /d "%~dp0"
-"C:\Users\26280\.workbuddy-ai\binaries\node\versions\22.22.2-2\node.exe" --env-file-if-exists=.env dist\scripts\receiver.js
+"%USERPROFILE%\.workbuddy-ai\binaries\node\versions\22.22.2-2\node.exe" --env-file-if-exists=.env dist\scripts\receiver.js
 echo.
 echo Receiver exited with code %ERRORLEVEL%.
 pause

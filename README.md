@@ -305,7 +305,28 @@ schtasks /Create /TN "mcp-qq-account receiver" /SC ONLOGON /RL LIMITED /F `
 
 `--env-file-if-exists=.env` 是必需的:计划任务的工作目录不是项目目录,不显式指定就读不到 `QQ_INBOX_DIR` 和重试间隔。**注意路径不要带中文**,否则 `.cmd` 包装层会因代码页问题读不到文件。
 
-不想碰计划任务,就双击项目根目录的 `start-receiver.bat`——它做的是同一件事,只是把窗口留在前台。
+不想碰计划任务,就用项目根目录里这三个 `.bat`。它们做的是同一件事,区别只在输出和触发方式:
+
+| 文件 | 触发方式 | 输出去向 | 用途 |
+|---|---|---|---|
+| `start-receiver.bat` | 双击 | 前台控制台 | 想看着它跑、看退出码 |
+| `start-receiver-boot.bat` | 被下面那个调用 | `receiver.log` | 无人值守时的实际载体 |
+| `startup-entry.bat` | 登录时 | — | 一行包装,最小化拉起上面那个后立即返回 |
+
+**装开机自启:把 `startup-entry.bat` 复制到 `shell:startup` 目录**(在资源管理器地址栏输入 `shell:startup` 回车即可打开)。文件名随意,这里用的是 `mcp-qq-account receiver.bat`。
+
+不需要管理员权限,也不需要碰注册表——它就是一个普通的 `.bat` 文件放在一个普通目录里。**取消自启就是删掉那个副本**,不留任何其他痕迹。
+
+装好后可以立刻验一次,不必等重启:
+
+```bash
+# 端口被谁占着
+netstat -ano | findstr :8790
+# 有几个接收器在等(正常情况下是 1 个,拿到端口后就是占着端口的那 1 个)
+wmic process where "name='node.exe'" get processid,commandline | findstr receiver.js
+```
+
+`startup-entry.bat` 里的路径是**绝对路径**,项目挪了位置就得重新复制一份。
 
 ### 宿主会把 MCP 服务反复重启
 
@@ -519,7 +540,9 @@ src/
 │   └── server.ts             OneBot 事件接收端点(鉴权 + 解析 + 入队 + 拒绝取证)
 ├── transports/
 │   └── http.ts               Streamable HTTP + Bearer 鉴权
-├── start-receiver.bat        双击即可常驻独立接收器(Windows)
+├── start-receiver.bat        双击即可常驻独立接收器,输出留在前台(Windows)
+├── start-receiver-boot.bat   同上,输出追加到 receiver.log,供开机自启用
+├── startup-entry.bat         复制到 shell:startup 即开机自启(最小化后立即返回)
 └── scripts/
     ├── lib/stdio-session.ts  可复用 stdio 会话(裸线协议)
     ├── smoke.ts              传输层冒烟(stdio)
