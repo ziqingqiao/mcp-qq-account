@@ -295,7 +295,10 @@ export function registerOneBotTools(server: McpServer, deps: OneBotToolsDeps): v
             pendingRemaining: stats.pending,
           },
           `Acknowledged ${result.acknowledged.length} message(s); ${stats.pending} still unread.` +
-            (result.unknown.length > 0 ? ` ${result.unknown.length} id(s) were not in the queue.` : ''),
+            (result.unknown.length > 0
+              ? ` Not in the queue, so nothing was acked: ${result.unknown.join(', ')}.` +
+                ' They were already handled, or never existed.'
+              : ''),
         );
       }),
   );

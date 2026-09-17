@@ -150,6 +150,20 @@ async function main(): Promise<void> {
     check('history structured content is still populated', Array.isArray(historyRows) && historyRows.length === 3, JSON.stringify(historyRows));
 
     // -----------------------------------------------------------------------
+    // Ack - an id that did not match must be named, not merely counted
+    // -----------------------------------------------------------------------
+    process.stderr.write('\nack\n');
+
+    const acked = await session.callTool('qq_ack_messages', { ids: ['no-such-id.json', 'also-missing.json'] });
+    check('acking an unknown id is not an error', !acked.isError, acked.text);
+    check(
+      'the unmatched ids are named, not just counted',
+      acked.text.includes('no-such-id.json') && acked.text.includes('also-missing.json'),
+      acked.text,
+    );
+    check('the text says what an unmatched id means', /already handled|never existed/i.test(acked.text), acked.text);
+
+    // -----------------------------------------------------------------------
     // Send
     // -----------------------------------------------------------------------
     process.stderr.write('\nsend\n');
